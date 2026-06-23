@@ -1,46 +1,51 @@
-# 🤖 에이전트 큐 처리 가이드 (Claude 세션이 읽음)
+# Queue processing guide (read by the Claude session)
 
-콘솔(app.py)은 **UI·서버·큐**만 담당한다. **실제 이미지·영상 생성은 Higgsfield MCP 전용**이라
-브라우저/파이썬이 직접 못 부른다 → **Claude 에이전트(이 세션)가 큐를 읽어 MCP로 처리**한다.
+The console (`app.py`) only owns the **UI, server and queue**. The actual image/video
+generation is **MCP-only**, which a browser/Python can't call — so **the Claude agent
+(this session) reads the queue and runs MCP.**
 
-## 트리거
-사용자가 콘솔에서 Enter로 보낸 요청은 `runtime/revision_queue.jsonl` 에 한 줄씩 쌓인다.
-사용자가 **"리뷰 큐 처리해줘"** 라고 하면 아래 루프를 수행한다.
+## Queue item shapes
+Each card submit lands one JSON line in `runtime/<mode>/revision_queue.jsonl`:
+- `{"type":"image","cut":"<id>","file":"<source filename>","src":"<rel path>","request":"...","model":"nano_banana_pro|nano_banana_2|gpt_image_2","quality":"1k|2k|4k"}`
+- `{"type":"video","cut":"<id>","file":"<source>","src":"<start image rel path>","request":"...","duration":5,"quality":"std|pro|4k"}`
+- `{"type":"batch_video","duration":5,"quality":"std"}`  ← [Make all into videos]
+- `cut` = filename stem; `src`/`file` = the source media relative to the media dir; `_idx` is added by qtool.
 
-## 처리 루프
-1. `runtime/.agent_offset`(이미 처리한 줄 수)부터 `runtime/revision_queue.jsonl` 의 **새 줄만** 읽는다.
-2. 각 항목 처리:
-   - **`type:"image"`** `{cut, request, model, quality}` :
-     - 원본 `MEDIA_DIR/cut{cut}_*.png` 를 `media_upload`→`media_confirm`
-     - 캐릭터 일관성용 캐릭터시트 ref(`../01_캐릭터시트/view_front.png` 등)도 함께 업로드(인물 컷이면)
-     - `generate_image({ model, prompt: 원장면 + "수정: "+request + 규칙0[A] + GAME_IMG_ENHANCE,
-                         medias:[{role:"image",value:원본_media_id},{role:"image",value:ref_media_id}],
-                         resolution: quality(1k/2k/4k), aspect_ratio:"16:9" })`
-     - 결과를 `MEDIA_DIR/_revisions/cut{cut}_rev{k}.png` 로 다운로드
-   - **`type:"video"`** `{cut, request, duration, quality}` — **모델 = Kling 3.0(`kling3_0`)**:
-     - 원본 컷 이미지를 `media_upload`→`media_confirm`
-     - `generate_video({ model:"kling3_0", prompt: 규칙0[B] No-BGM·SFX only + request, duration,
-                         medias:[{role:"start_image",value:media_id}], aspect_ratio:"16:9",
-                         params: { mode: quality(std/pro/4k), sound:"off" } })`   # sound:off = 무음(No-BGM, SFX/BGM은 후반 합성)
-     - mp4를 `../_영상/cut{NN}.mp4`(단일 전환) 로 다운로드 → `result --status video_done --idx`(이미지 카드엔 "🎬 영상 생성됨" 칩만, 이미지 유지)
-   - **`type:"batch_video"`** `{duration, quality}` : [전체 영상으로 돌리기].
-     `_신규생성/`의 모든 cut 이미지를 위 Kling 절차로 일괄 생성(동시 8 한도 큐) → `../_영상/cut{NN}.mp4`
-3. 항목 완료 시 `runtime/results.json` 갱신:
-   ```json
-   { "01": { "status":"done", "src":"/media/_revisions/cut01_rev1.png", "ts":1782177000 } }
-   ```
-   (영상 batch는 `src":"/media/cut01.mp4"`). 콘솔이 4초마다 폴링해 썸네일 자동 교체.
-   처리 중에는 `{"status":"running","msg":"..."}`, 실패는 `{"status":"error","msg":"..."}`.
-4. 처리한 줄 수를 `runtime/.agent_offset` 에 저장.
+## Processing loop
+1. **Watch:** `python3 <skill>/qtool.py --mode <image|video> wait --timeout 3000`
+   → prints new queue lines as a JSON array (each with `_idx`); `[]` on timeout. Run it as a background Bash
+   and wake on its completion to process, then relaunch.
+2. Process each item (`media_dir` = `runtime/<mode>/media_dir.txt`):
+   - **Common:** `media_upload` → PUT bytes → `media_confirm` on `media_dir/<src or file>`. Add identity/reference
+     images too if the project needs character consistency.
+   - **`type:"image"`** — `generate_image({ model, prompt: original scene + " revise: " + request (+ project enhance constants),
+       medias:[{role:"image",value:source_id}(,refs)], resolution: quality, aspect_ratio: source ratio })`
+     → save to `media_dir/_revisions/<cut>_rev<k>.png` (keep the original).
+     → `qtool result --mode image --cut <cut> --status done --src /media/_revisions/<cut>_rev<k>.png --idx <_idx>`
+   - **`type:"video"`** — model = **Kling 3.0 (`kling3_0`)**.
+     `generate_video({ model:"kling3_0", prompt: "No background music. SFX only. " + request, duration,
+       medias:[{role:"start_image",value:source_id}], aspect_ratio: source ratio, params:{ mode: quality, sound:"off" } })`
+     → save the mp4 to the video folder (e.g. `../_영상/<cut>.mp4`).
+     → **Write video metadata (for the Videos page):** merge into `<video-folder>/_video_meta.json`
+       `{"<cut>": {"file":"<cut>.mp4","src":"<start image rel path>","prompt":"<prompt used>","duration":N,"quality":"std","ts":<unix sec>}}`
+       (the page watches `ts` increasing to swap the dim image for the video; `src` is reused as the next regenerate's start image).
+     → If triggered from the image console: `qtool result --mode image --cut <cut> --status video_done --idx <_idx>`
+       (image card keeps the image, just shows a "video generated" chip). If re-revising in the video console:
+       `--status done --src /media/<cut>_rev<k>.mp4`.
+   - **`type:"batch_video"`** — [Make all into videos]: run every cut image through the Kling step above
+     (8-concurrent cap, queue overflow) → fill the video folder. Then auto-open the **video review console**:
+     `python3 app.py --mode video --media-dir <video folder> --port 8766`.
+3. While running: `qtool result --mode <m> --cut <cut> --status running --msg "..."`; on failure `--status error --msg "..."`.
+   The console polls `results.json` every 4s and swaps thumbnails.
 
-## 규칙
-- **동시 8개 한도**(Higgsfield) 준수. 초과분은 큐로.
-- **재생성은 새 파일**(`_revisions/`) — 원본 보존(절대 규칙).
-- 폴링·다운로드가 길면 **백그라운드 에이전트**에 위임.
-- 규칙0(이미지 화각/역광/네거티브필, 영상 No-BGM·SFX only) + GAME_IMG/VID_ENHANCE 항상 주입.
-- 인물 일관성: 영웅 컷은 `../01_캐릭터시트/view_front.png`+`view_34.png` ref 유지.
+## Rules
+- **8-concurrent cap** (Higgsfield); queue the overflow.
+- **Regenerations are new files** (`_revisions/<cut>_rev<k>.*`) — never overwrite the original.
+- Poll/download via `job_status(sync:true)` → `curl -o`.
+- Inject project enhancement constants (cinematic framing, backlight, No-BGM, etc.) on every prompt if the project defines them.
 
-## batch_video 완료 후
-모든 컷 mp4가 `../_영상/`에 차면 **영상 리뷰 콘솔을 자동 팝업**:
-`python3 app.py --mode video --media-dir "../_영상" --port 8766`
-(또는 `run_video.command` 더블클릭) → 같은 디자인으로 영상 미리보기 + 컷별 Seedance 재수정.
+## ★ Permission trap (important)
+For the background watcher/processing to call tools, `settings.local.json` allow must include
+`Bash(python3 *)`, `Bash(curl *)`, and `mcp__higgsfield__{generate_image,generate_video,media_upload,media_confirm,job_status}`.
+`cd ... && python3` compound commands break matching — call `qtool`/`app.py` by **absolute path**.
+A long idle may time out the watcher → just relaunch it.
