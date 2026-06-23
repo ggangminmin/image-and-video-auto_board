@@ -1,0 +1,18 @@
+# 런타임/캐시
+**/runtime/
+**/__pycache__/
+.DS_Store
+*.log
+# 미디어(깃 비대화 방지 — 도구·문서만 버전관리)
+*.png
+*.jpg
+*.jpeg
+*.webp
+*.gif
+*.mp4
+*.mov
+*.webm
+*.m4v
+*.mp3
+*.wav
+*.m4a
